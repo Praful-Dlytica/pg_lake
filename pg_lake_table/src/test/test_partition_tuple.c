@@ -29,7 +29,7 @@
 #include "pg_lake/iceberg/catalog.h"
 #include "pg_lake/iceberg/iceberg_type_binary_serde.h"
 #include "pg_lake/iceberg/partitioning/partition.h"
-#include "pg_lake/iceberg/temporal_utils.h"
+#include "pg_lake/util/temporal_utils.h"
 
 
 static TupleTableSlot *make_tuple_slot_from_record(Oid relationId, HeapTupleHeader rowHeader);

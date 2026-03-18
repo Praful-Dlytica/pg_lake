@@ -1745,3 +1745,70 @@ def test_stringify_map():
     result = stringify_map({"a": "b", "c": [1, 2, 3]})
 
     assert result == '{"(a,b)","(c,\\"{1,2,3}\\")"}'
+
+
+@pytest.mark.parametrize("fmt", ["parquet", "csv", "json"])
+def test_out_of_range_values_writable_rejected(s3, pg_conn, extension, fmt):
+    """Writable non-iceberg tables reject the out_of_range_values option."""
+    location = f"s3://{TEST_BUCKET}/test_oor_writable_{fmt}/"
+
+    error = run_command(
+        f"""
+        CREATE FOREIGN TABLE oor_writable_{fmt} (id int)
+        SERVER pg_lake OPTIONS (writable 'true', format '{fmt}', location '{location}',
+                                out_of_range_values 'clamp');
+    """,
+        pg_conn,
+        raise_error=False,
+    )
+    assert "out_of_range_values" in error
+    pg_conn.rollback()
+
+
+def test_out_of_range_values_readable_parquet_rejected(s3, pg_conn, extension):
+    """Readable parquet tables reject the out_of_range_values option."""
+    url = f"s3://{TEST_BUCKET}/test_oor_readable_parquet/data.parquet"
+
+    run_command(
+        f"COPY (SELECT 1 AS id) TO '{url}';",
+        pg_conn,
+    )
+
+    error = run_command(
+        f"""
+        CREATE FOREIGN TABLE oor_readable_parquet (id int)
+        SERVER pg_lake OPTIONS (format 'parquet', path '{url}',
+                                out_of_range_values 'clamp');
+    """,
+        pg_conn,
+        raise_error=False,
+    )
+    assert "out_of_range_values" in error
+    pg_conn.rollback()
+
+
+@pytest.mark.parametrize("value", ["clamp", "error"])
+def test_out_of_range_values_iceberg(
+    s3, pg_conn, extension, with_default_location, value
+):
+    """Iceberg tables accept the out_of_range_values option."""
+    run_command(
+        f"CREATE TABLE oor_iceberg (id int) USING iceberg WITH (out_of_range_values = '{value}');",
+        pg_conn,
+    )
+    pg_conn.rollback()
+
+
+def test_out_of_range_values_invalid_value(
+    s3, pg_conn, extension, with_default_location
+):
+    """Invalid out_of_range_values option value is rejected on iceberg tables."""
+    error = run_command(
+        "CREATE TABLE oor_invalid (id int) USING iceberg"
+        " WITH (out_of_range_values = 'ignore');",
+        pg_conn,
+        raise_error=False,
+    )
+    assert "invalid out_of_range_values" in error
+
+    pg_conn.rollback()

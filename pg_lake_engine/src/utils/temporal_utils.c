@@ -17,15 +17,17 @@
 
 #include "postgres.h"
 
-#include "pg_lake/iceberg/utils.h"
+#include "catalog/pg_type.h"
+#include "pg_lake/util/temporal_utils.h"
+#include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/timestamp.h"
 
 static const int32 PostgresToUnixEpochDiffInDays = POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE;
 static const int64 PostgresToUnixEpochDiffInMicrosecs = ((int64) PostgresToUnixEpochDiffInDays) * USECS_PER_DAY;
 
-static void EnsureNotInfinityDate(DateADT date);
-static void EnsureNotInfinityTimestamp(Timestamp ts);
+static void EnsureFiniteDate(DateADT date);
+static void EnsureFiniteTimestamp(Timestamp ts);
 
 #define UNIX_EPOCH_YEAR 1970
 
@@ -37,6 +39,41 @@ static void EnsureNotInfinityTimestamp(Timestamp ts);
 #define DIV_FLOOR_INT64(x, y)  \
     ( ((x) >= 0) ? ((x) / (y)) \
                  : (-((-(x) + (y) - 1) / (y))) )
+
+
+/*
+ * GetYearFromDate extracts the year from a PostgreSQL DateADT.
+ */
+int
+GetYearFromDate(DateADT d)
+{
+	int			y,
+				m,
+				day;
+
+	j2date(d + POSTGRES_EPOCH_JDATE, &y, &m, &day);
+	return y;
+}
+
+
+/*
+ * GetYearFromTimestamp extracts the year from a PostgreSQL Timestamp
+ * (works for both Timestamp and TimestampTz since they share the
+ * same representation).
+ */
+int
+GetYearFromTimestamp(Timestamp ts)
+{
+	struct pg_tm tt;
+	fsec_t		fsec;
+
+	if (timestamp2tm(ts, NULL, &tt, &fsec, NULL, NULL) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("timestamp out of range")));
+
+	return tt.tm_year;
+}
 
 
 /*
@@ -124,14 +161,9 @@ AdjustTimestampFromPostgresToUnix(Timestamp timestamp)
 int32_t
 DateYearFromUnixEpoch(DateADT date)
 {
-	EnsureNotInfinityDate(date);
+	EnsureFiniteDate(date);
 
-	int			year;
-	int			month;
-	int			day;
-
-	j2date(date + POSTGRES_EPOCH_JDATE, &year, &month, &day);
-	int32		years = (year - UNIX_EPOCH_YEAR);
+	int32		years = (GetYearFromDate(date) - UNIX_EPOCH_YEAR);
 
 #ifdef USE_ASSERT_CHECKING
 
@@ -257,7 +289,7 @@ YearsFromEpochToTimestamp(int32 yearsSinceEpoch)
 int32_t
 DateMonthFromUnixEpoch(DateADT date)
 {
-	EnsureNotInfinityDate(date);
+	EnsureFiniteDate(date);
 
 	int			year;
 	int			month;
@@ -285,7 +317,7 @@ DateMonthFromUnixEpoch(DateADT date)
 int32_t
 DateDayFromUnixEpoch(DateADT date)
 {
-	EnsureNotInfinityDate(date);
+	EnsureFiniteDate(date);
 
 	return (int32_t) AdjustDateFromPostgresToUnix(date);
 }
@@ -301,17 +333,9 @@ DateDayFromUnixEpoch(DateADT date)
 int32_t
 TimestampYearFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	EnsureFiniteTimestamp(ts);
 
-	struct pg_tm tm;
-	fsec_t		fsec;
-
-	if (timestamp2tm(ts, NULL, &tm, &fsec, NULL, NULL) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("timestamp out of range")));
-
-	return tm.tm_year - UNIX_EPOCH_YEAR;
+	return GetYearFromTimestamp(ts) - UNIX_EPOCH_YEAR;
 }
 
 
@@ -325,7 +349,7 @@ TimestampYearFromUnixEpoch(Timestamp ts)
 int32_t
 TimestampMonthFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	EnsureFiniteTimestamp(ts);
 
 	struct pg_tm tm;
 	fsec_t		fsec;
@@ -386,7 +410,7 @@ MonthsFromUnixEpochToTimestamp(int32 monthsSinceEpoch)
 int32_t
 TimestampDayFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	EnsureFiniteTimestamp(ts);
 
 	Timestamp	unixTs = AdjustTimestampFromPostgresToUnix(ts);
 
@@ -405,7 +429,7 @@ TimestampDayFromUnixEpoch(Timestamp ts)
 int32_t
 TimestampHourFromUnixEpoch(Timestamp ts)
 {
-	EnsureNotInfinityTimestamp(ts);
+	EnsureFiniteTimestamp(ts);
 
 	Timestamp	unixTs = AdjustTimestampFromPostgresToUnix(ts);
 
@@ -458,31 +482,47 @@ HoursFromUnixEpochToTime(int32 hoursSinceEpoch)
 
 
 /*
- * EnsureNotInfinityDate checks if the given date is +-Infinity.
- * If it is, it raises an error. +-Infinity is not a meaningful value for
- * some query engines.
+ * MakeDateFromYMD creates a DateADT from year, month, day.
  */
+DateADT
+MakeDateFromYMD(int y, int m, int d)
+{
+	return date2j(y, m, d) - POSTGRES_EPOCH_JDATE;
+}
+
+
+/*
+ * MakeTimestampUsec creates a Timestamp from date/time components
+ * including microseconds (no timezone; for TimestampTz the caller casts).
+ */
+Timestamp
+MakeTimestampUsec(int y, int m, int d, int h, int min, int sec, int usec)
+{
+	DateADT		date = MakeDateFromYMD(y, m, d);
+	Timestamp	result;
+
+	result = (Timestamp) date * USECS_PER_DAY +
+		((((h * 60) + min) * 60) + sec) * USECS_PER_SEC + usec;
+
+	return result;
+}
+
+
 static void
-EnsureNotInfinityDate(DateADT date)
+EnsureFiniteDate(DateADT date)
 {
 	if (DATE_NOT_FINITE(date))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("+-Infinity dates are not allowed in iceberg tables"),
-				 errhint("Delete or replace +-Infinity values.")));
+				 errmsg("infinite date is not allowed in Iceberg tables")));
 }
 
-/*
- * EnsureNotInfinityTimestamp checks if the given timestamp is +-Infinity.
- * If it is, it raises an error. +-Infinity is not a meaningful value for
- * some query engines.
- */
+
 static void
-EnsureNotInfinityTimestamp(Timestamp ts)
+EnsureFiniteTimestamp(Timestamp ts)
 {
 	if (TIMESTAMP_NOT_FINITE(ts))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("+-Infinity timestamps are not allowed in iceberg tables"),
-				 errhint("Delete or replace +-Infinity values.")));
+				 errmsg("infinite timestamp is not allowed in Iceberg tables")));
 }

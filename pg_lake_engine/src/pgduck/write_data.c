@@ -29,10 +29,10 @@
 #include "pg_lake/extensions/postgis.h"
 #include "pg_lake/parquet/field.h"
 #include "pg_lake/parquet/geoparquet.h"
-#include "pg_lake/parsetree/options.h"
 #include "pg_lake/pgduck/numeric.h"
 #include "pg_lake/pgduck/read_data.h"
 #include "pg_lake/pgduck/type.h"
+#include "pg_lake/pgduck/iceberg_query_validation.h"
 #include "pg_lake/pgduck/write_data.h"
 #include "pg_lake/util/numeric.h"
 #include "nodes/pg_list.h"
@@ -92,6 +92,7 @@ ConvertCSVFileTo(char *csvFilePath, TupleDesc csvTupleDesc, int maxLineSize,
 
 	bool		queryHasRowIds = false;
 
+	/* CSV data is already clamped by WriteInsertRecord */
 	return WriteQueryResultTo(command.data,
 							  destinationPath,
 							  destinationFormat,
@@ -100,7 +101,8 @@ ConvertCSVFileTo(char *csvFilePath, TupleDesc csvTupleDesc, int maxLineSize,
 							  queryHasRowIds,
 							  schema,
 							  csvTupleDesc,
-							  leafFields);
+							  leafFields,
+							  ICEBERG_OOR_NONE);
 }
 
 
@@ -118,8 +120,16 @@ WriteQueryResultTo(char *query,
 				   bool queryHasRowId,
 				   DataFileSchema * schema,
 				   TupleDesc queryTupleDesc,
-				   List *leafFields)
+				   List *leafFields,
+				   IcebergOutOfRangePolicy outOfRangePolicy)
 {
+	if (outOfRangePolicy != ICEBERG_OOR_NONE)
+	{
+		query = IcebergWrapQueryWithErrorOrClampChecks(query, queryTupleDesc,
+													   outOfRangePolicy,
+													   queryHasRowId);
+	}
+
 	StringInfoData command;
 
 	initStringInfo(&command);
@@ -639,6 +649,7 @@ ChooseDuckDBEngineTypeForWrite(PGType postgresType,
 			 * happy case: we can map to DECIMAL(precision, scale)
 			 */
 			typeModifier = psprintf("(%d,%d)", precision, scale);
+			duckTypeId = DUCKDB_TYPE_DECIMAL;
 		}
 		else
 		{

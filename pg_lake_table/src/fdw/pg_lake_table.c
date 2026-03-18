@@ -91,6 +91,7 @@
 #include "pg_lake/permissions/roles.h"
 #include "pg_extension_base/pg_compat.h"
 #include "pg_lake/pgduck/array_conversion.h"
+#include "pg_lake/pgduck/iceberg_datum_validation.h"
 #include "pg_lake/pgduck/client.h"
 #include "pg_lake/pgduck/explain.h"
 #include "pg_lake/pgduck/rewrite_query.h"
@@ -229,6 +230,7 @@ typedef struct PgLakeModifyState
 {
 	/* relcache entry for the foreign table */
 	Relation	rel;
+	TupleDesc	tupleDesc;
 
 	/* type of modification operation */
 	CmdType		operation;
@@ -236,6 +238,10 @@ typedef struct PgLakeModifyState
 	/* destination for inserts */
 	DestReceiver *insertDest;
 	uint64		insertedRowCount;
+
+	/* out-of-range policy for the table */
+	IcebergOutOfRangePolicy outOfRangePolicy;
+	bool		needsOutOfRangeValidation;
 
 	/* slot used for position deletes */
 	TupleTableSlot *deleteSlot;
@@ -2570,20 +2576,89 @@ postgresIsForeignRelUpdatable(Relation rel)
 
 
 /*
- * WriteInsertRecord writes the tuple held by the given slot to the insert
- * destination.
+ * TupleDescNeedsIcebergValidation returns true if any non-dropped column
+ * is temporal or numeric (i.e. requires IcebergErrorOrClampDatum processing).
+ */
+static bool
+TupleDescNeedsIcebergValidation(TupleDesc tupleDesc)
+{
+	for (int i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+
+		if (attr->attisdropped)
+			continue;
+
+		if (IsTemporalType(attr->atttypid) || attr->atttypid == NUMERICOID)
+			return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * IcebergErrorOrClampSlotInPlace clamps or rejects out-of-range temporal and numeric
+ * values in the slot, modifying it in-place.
+ */
+static void
+IcebergErrorOrClampSlotInPlace(TupleTableSlot *slot, TupleDesc tupleDesc,
+							   IcebergOutOfRangePolicy policy)
+{
+	int			natts = tupleDesc->natts;
+
+	slot_getallattrs(slot);
+
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+
+		if (attr->attisdropped || slot->tts_isnull[i])
+			continue;
+
+		if (!IsTemporalType(attr->atttypid) && attr->atttypid != NUMERICOID)
+			continue;
+
+		bool		isNull = false;
+		Datum		clamped = IcebergErrorOrClampDatum(slot->tts_values[i],
+													   attr->atttypid,
+													   policy,
+													   &isNull);
+
+		/*
+		 * Safe to assign directly: - temporal types
+		 * (date/timestamp/timestamptz) are pass-by-value, so clamped values
+		 * need no detoasting or copying. - numeric is pass-by-reference, but
+		 * the clamp function either returns the original datum unchanged or
+		 * sets isNull = true (NaN case), so no new allocation needs to be
+		 * managed.
+		 */
+		slot->tts_values[i] = clamped;
+		slot->tts_isnull[i] = isNull;
+	}
+}
+
+
+/*
+ * WriteInsertRecord validates the tuple against Iceberg write constraints
+ * (when applicable) and forwards it to the insert destination.
  */
 static void
 WriteInsertRecord(PgLakeModifyState * modifyState, TupleTableSlot *slot)
 {
 	DestReceiver *insertDest = modifyState->insertDest;
 
+	if (modifyState->outOfRangePolicy != ICEBERG_OOR_NONE &&
+		modifyState->needsOutOfRangeValidation)
+		IcebergErrorOrClampSlotInPlace(slot, modifyState->tupleDesc,
+									   modifyState->outOfRangePolicy);
+
 	if (modifyState->insertedRowCount == 0)
 	{
 		/* incoming inserts have the tuple descriptor of the table */
 		insertDest->rStartup(insertDest,
 							 CMD_INSERT,
-							 RelationGetDescr(modifyState->rel));
+							 modifyState->tupleDesc);
 	}
 
 	insertDest->receiveSlot(slot, insertDest);
@@ -3404,6 +3479,11 @@ create_foreign_modify(Relation rel,
 												specId,
 												0);
 		}
+
+		fmstate->tupleDesc = RelationGetDescr(rel);
+		fmstate->outOfRangePolicy =
+			GetIcebergOutOfRangePolicyForTable(relationId);
+		fmstate->needsOutOfRangeValidation = TupleDescNeedsIcebergValidation(fmstate->tupleDesc);
 	}
 
 	if (operation == CMD_UPDATE || operation == CMD_DELETE)
@@ -3487,7 +3567,8 @@ create_foreign_modify(Relation rel,
 					char	   *tempFileName = GenerateTempFileName("lake_table_delete", true);
 
 					fileModifyState->deleteFile = tempFileName;
-					fileModifyState->deleteDest = CreateCSVDestReceiver(tempFileName, copyOptions, foreignTableFormat);
+					fileModifyState->deleteDest = CreateCSVDestReceiver(tempFileName, copyOptions,
+																		foreignTableFormat);
 				}
 
 				fileModifyStates = lappend(fileModifyStates, fileModifyState);
@@ -3793,7 +3874,7 @@ process_query_params(ExprContext *econtext,
 		else
 
 			param_values[i] = PGDuckSerialize(&param_flinfo[i], exprType((Node *) expr_state->expr), expr_value,
-														  DATA_FORMAT_INVALID);
+											  DATA_FORMAT_INVALID);
 		i++;
 	}
 
